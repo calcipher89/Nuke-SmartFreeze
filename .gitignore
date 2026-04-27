@@ -1,0 +1,8 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Nuke artifacts (just in case)
+*.autosave
+*.tmp
