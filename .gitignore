@@ -1,8 +1,39 @@
-# Python artifacts
+# =========================
+# Operating System Files
+# =========================
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.cab
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# =========================
+# Python & Nuke Artifacts
+# =========================
 __pycache__/
 *.py[cod]
 *$py.class
-
+*.autosave
+*.tmp
+# ==============================
 # Nuke artifacts (just in case)
+# ==============================
 *.autosave
 *.tmp
