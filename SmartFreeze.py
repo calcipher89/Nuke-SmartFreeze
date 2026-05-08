@@ -7,20 +7,27 @@ to eliminate UI lag in heavy Nuke scripts.
 Version History:
 ----------------
 [... previous history truncated for brevity ...]
-v3.2 - Code review optimizations: Migrated to Qt.py shim for cleaner imports. Added early exit 
-       guard if no active stacks are found to save overhead. Hardened framebuffer grabs against 
-       unbound variable crashes using hasattr() checks.
+v3.7 - LAYOUT CORRUPTION FIX: Prevented dummy widget from being serialized into Nuke's uistate.ini.
+v3.8 - UI STATE SYNC: Instantly unfreezes when target widgets receive Hide or Close events.
+v3.9 - GHOST TAB FIX: Aggressively orphaned the dummy widget during unfreeze (setParent(None)) 
+       to prevent Nuke's layout manager from spawning empty tabs during rapid workspace swaps.
 """
 
 import nuke
-
-# Dev Feedback 1: Use the VFX industry standard Qt shim instead of clunky try/except blocks
 from Qt import QtCore, QtWidgets, QtGui
 
-DEBUG = False  
+_PREFS = nuke.toNode("preferences")
+
+def is_smartfreeze_enabled():
+    k = _PREFS.knob("smartfreeze_enable")
+    return k.value() if k else True
+
+def is_logging_enabled():
+    k = _PREFS.knob("smartfreeze_logging")
+    return k.value() if k else False
 
 def log(msg):
-    if DEBUG:
+    if is_logging_enabled():
         print(msg)
 
 
@@ -29,7 +36,6 @@ class DummyPreview(QtWidgets.QLabel):
         super().__init__(parent)
         self.setPixmap(pixmap)
         self.setScaledContents(True)
-        self.setObjectName("SmartFreezeDummy")
 
 
 class ViewerSmartFreeze(QtCore.QObject):
@@ -37,6 +43,9 @@ class ViewerSmartFreeze(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._frozen = False
+        self._is_unfreezing = False  
+        self._monitored_ids = set()  
+        
         self._dag_rects = {}
         self._current_dummies = []  
         
@@ -45,7 +54,9 @@ class ViewerSmartFreeze(QtCore.QObject):
         self._unfreeze_timer.setInterval(80)
         self._unfreeze_timer.timeout.connect(self._do_unfreeze)
 
-        QtWidgets.QApplication.instance().installEventFilter(self)
+        app = QtWidgets.QApplication.instance()
+        app.installEventFilter(self)
+        app.aboutToQuit.connect(self.cleanup)
 
         log("[SmartFreeze] Action-Based Trigger Ready.")
 
@@ -82,7 +93,6 @@ class ViewerSmartFreeze(QtCore.QObject):
                     break
                 w = w.parent()
             except RuntimeError:
-                # Essential PySide safety net: Nuke destroyed the C++ object mid-loop
                 return False
 
         if viewer_widget:
@@ -103,7 +113,48 @@ class ViewerSmartFreeze(QtCore.QObject):
                 return True
         return False
 
+    def _check_layout_integrity(self):
+        if not self._frozen:
+            return True
+            
+        if not self._current_dummies:
+            return False
+            
+        for item in self._current_dummies:
+            try:
+                item['dummy'].parent()
+            except RuntimeError:
+                return False
+        return True
+
     def eventFilter(self, obj, event):
+        if not is_smartfreeze_enabled():
+            if self._frozen:
+                self._do_unfreeze()
+            return False
+
+        if event.type() == QtCore.QEvent.ApplicationDeactivate:
+            if self._frozen:
+                self._do_unfreeze(force_silent=True)
+                log("[SmartFreeze] ⚠️ Focus lost. Unfrozen to protect layout saves.")
+            return False
+
+        if self._frozen and not self._is_unfreezing:
+            if event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.Close):
+                if id(obj) in self._monitored_ids:
+                    self._do_unfreeze(force_silent=True)
+                    log("[SmartFreeze] ⚠️ UI layout change detected. Syncing unfreeze state.")
+                    return False
+
+        if self._frozen and event.type() in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseMove):
+            if not self._check_layout_integrity():
+                self._current_dummies.clear()
+                self._dag_rects.clear()
+                self._monitored_ids.clear()
+                self._frozen = False
+                self._unfreeze_timer.stop()
+                log("[SmartFreeze] ⚠️ Zombie state purged via integrity check.")
+
         if event.type() == QtCore.QEvent.MouseButtonPress:
             if event.button() == QtCore.Qt.LeftButton:
                 global_pos = event.globalPos()
@@ -125,6 +176,7 @@ class ViewerSmartFreeze(QtCore.QObject):
     def _freeze(self):
         self._unfreeze_timer.stop()
         self._dag_rects.clear()
+        self._monitored_ids.clear()
         
         active_stacks = {}
         for gl in self._get_dag_gl_widgets():
@@ -132,7 +184,6 @@ class ViewerSmartFreeze(QtCore.QObject):
             if stack and stack not in active_stacks:
                 active_stacks[stack] = gl
 
-        # Dev Feedback 3: Early exit optimization. Don't freeze if nothing is active!
         if not active_stacks:
             return
 
@@ -140,14 +191,12 @@ class ViewerSmartFreeze(QtCore.QObject):
             if isinstance(stack.currentWidget(), DummyPreview):
                 continue
 
-            # Dev Feedback 2 & 4: Bulletproof frame grabbing using hasattr
             frame = None
             if hasattr(gl, 'grabFrameBuffer'):
                 frame = gl.grabFrameBuffer()
             elif hasattr(gl, 'grabFramebuffer'):
                 frame = gl.grabFramebuffer()
             
-            # If grabbing failed, skip this widget entirely to avoid a crash
             if frame is None:
                 continue
                 
@@ -169,6 +218,9 @@ class ViewerSmartFreeze(QtCore.QObject):
                 'restore_widget': freeze_widget
             })
             
+            self._monitored_ids.add(id(dummy))
+            self._monitored_ids.add(id(stack))
+            
         self._frozen = True
         log("[SmartFreeze] ❄️  Frozen by Timeline Action")
 
@@ -177,44 +229,73 @@ class ViewerSmartFreeze(QtCore.QObject):
             return
         self._unfreeze_timer.start()
 
-    def _do_unfreeze(self):
-        for item in self._current_dummies:
-            stack = item['stack']
-            dummy = item['dummy']
-            restore_widget = item['restore_widget']
-
-            try:
-                stack.setCurrentWidget(restore_widget)
-            except RuntimeError:
-                pass
-            
-            stack.removeWidget(dummy)
-            dummy.deleteLater()
-            
-        self._current_dummies.clear()
-        self._dag_rects.clear()
-        self._frozen = False
-        log("[SmartFreeze] ✅  Unfrozen by DAG Hover")
-
-    def cleanup(self):
-        QtWidgets.QApplication.instance().removeEventFilter(self)
-        self._unfreeze_timer.stop()
+    def _do_unfreeze(self, force_silent=False):
+        self._is_unfreezing = True
         
         for item in self._current_dummies:
             stack = item['stack']
             dummy = item['dummy']
             restore_widget = item['restore_widget']
+
             try:
                 stack.setCurrentWidget(restore_widget)
             except RuntimeError:
                 pass
-            stack.removeWidget(dummy)
-            dummy.deleteLater()
+            
+            try:
+                stack.removeWidget(dummy)
+                # v3.9 Fix: Instantly orphan the widget from Nuke's UI tree 
+                # before the Qt trash collector takes over.
+                dummy.hide()
+                dummy.setParent(None)
+            except RuntimeError:
+                pass
+                
+            try:
+                dummy.deleteLater()
+            except RuntimeError:
+                pass
             
         self._current_dummies.clear()
+        self._dag_rects.clear()
+        self._monitored_ids.clear()
+        self._frozen = False
+        self._is_unfreezing = False
+        
+        if not force_silent:
+            log("[SmartFreeze] ✅  Unfrozen by DAG Hover")
+
+    def cleanup(self):
+        QtWidgets.QApplication.instance().removeEventFilter(self)
+        self._unfreeze_timer.stop()
+        self._do_unfreeze(force_silent=True)
 
 
-# --- HOT-RELOAD SAFETY ---
+# --- PREFERENCES SETUP ---
+def setup_preferences():
+    prefs = nuke.toNode("preferences")
+    
+    if prefs.knob("SmartFreeze") is None:
+        prefs.addKnob(nuke.Tab_Knob("SmartFreeze"))
+        
+    if not prefs.knob("smartfreeze_enable"):
+        prefs.addKnob(nuke.Text_Knob("smartfreeze_heading", "<h3>SmartFreeze Settings</h3>"))
+        prefs.knob("smartfreeze_heading").setFlag(nuke.STARTLINE)
+        
+        enable_knob = nuke.Boolean_Knob("smartfreeze_enable", "Enable SmartFreeze")
+        enable_knob.setValue(True)
+        enable_knob.setFlag(nuke.STARTLINE)
+        prefs.addKnob(enable_knob)
+        
+        log_knob = nuke.Boolean_Knob("smartfreeze_logging", "Enable Console Logging")
+        log_knob.setValue(False)
+        log_knob.setFlag(nuke.STARTLINE)
+        prefs.addKnob(log_knob)
+
+
+# --- INITIALIZATION & HOT-RELOAD SAFETY ---
+setup_preferences()
+
 if hasattr(nuke, '_viewer_smart_freeze'):
     nuke._viewer_smart_freeze.cleanup()
     del nuke._viewer_smart_freeze
